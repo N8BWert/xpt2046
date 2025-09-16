@@ -23,7 +23,6 @@ use crate::calibration::{calculate_calibration, calibration_draw_point};
 pub use crate::{
     calibration::CalibrationPoint,
     error::{BusError, Error},
-    exti_pin::Xpt2046Exti,
 };
 use core::{fmt::Debug, ops::RemAssign};
 use embedded_graphics_core::{
@@ -31,16 +30,13 @@ use embedded_graphics_core::{
     geometry::Point,
     pixelcolor::{Rgb565, RgbColor},
 };
-use embedded_hal::{
-    delay::blocking::DelayUs, digital::blocking::OutputPin, spi::blocking::Transfer,
-};
+use embedded_hal::{delay::DelayNs, digital::{InputPin, OutputPin}, spi::SpiDevice};
 
 #[cfg(feature = "with_defmt")]
 use defmt::Format;
 
 pub mod calibration;
 pub mod error;
-pub mod exti_pin;
 
 const CHANNEL_SETTING_X: u8 = 0b10010000;
 const CHANNEL_SETTING_Y: u8 = 0b11010000;
@@ -206,9 +202,9 @@ pub struct Xpt2046<SPI, CS, PinIRQ> {
 
 impl<SPI, CS, PinIRQ> Xpt2046<SPI, CS, PinIRQ>
 where
-    SPI: Transfer<u8>,
+    SPI: SpiDevice<u8>,
     CS: OutputPin,
-    PinIRQ: Xpt2046Exti,
+    PinIRQ: InputPin,
 {
     pub fn new(spi: SPI, cs: CS, irq: PinIRQ, orientation: Orientation) -> Self {
         Self {
@@ -228,9 +224,9 @@ where
 
 impl<SPI, CS, PinIRQ, SPIError, CSError> Xpt2046<SPI, CS, PinIRQ>
 where
-    SPI: Transfer<u8, Error = SPIError>,
+    SPI: SpiDevice<u8, Error = SPIError>,
     CS: OutputPin<Error = CSError>,
-    PinIRQ: Xpt2046Exti,
+    PinIRQ: InputPin<Error = CSError>,
     SPIError: Debug,
     CSError: Debug,
 {
@@ -297,14 +293,14 @@ where
     }
 
     /// Reset the driver and preload tx buffer with register data.
-    pub fn init<D: DelayUs>(
+    pub fn init<D: DelayNs>(
         &mut self,
         delay: &mut D,
     ) -> Result<(), Error<BusError<SPIError, CSError>>> {
         self.tx_buff[0] = 0x80;
         self.cs.set_high()?;
         self.spi_read()?;
-        delay.delay_ms(1).map_err(|_| Error::Delay)?;
+        delay.delay_ms(1);
 
         /*
          * Load the tx_buffer with the channels config
@@ -327,17 +323,16 @@ where
     /// interrupt
     pub fn run(
         &mut self,
-        exti: &mut PinIRQ::Exti,
     ) -> Result<(), Error<BusError<SPIError, CSError>>> {
         match self.screen_state {
             TouchScreenState::IDLE => {
-                if self.operation_mode == TouchScreenOperationMode::CALIBRATION && self.irq.is_low()
+                if self.operation_mode == TouchScreenOperationMode::CALIBRATION && self.irq.is_low()?
                 {
                     self.screen_state = TouchScreenState::PRESAMPLING;
                 }
             }
             TouchScreenState::PRESAMPLING => {
-                if self.irq.is_high() {
+                if self.irq.is_high()? {
                     self.screen_state = TouchScreenState::RELEASED
                 }
                 let point_sample = self.read_touch_point()?;
@@ -357,40 +352,16 @@ where
                  * is touched for longer time
                  */
                 self.ts.counter.rem_assign(MAX_SAMPLES - 1);
-                if self.irq.is_high() {
+                if self.irq.is_high()? {
                     self.screen_state = TouchScreenState::RELEASED
                 }
             }
             TouchScreenState::RELEASED => {
                 self.screen_state = TouchScreenState::IDLE;
                 self.ts.counter = 0;
-                /*
-                 * The PENIRQ should be re-enabled in here
-                 * as we finished sending any data to the touch controller
-                 */
-                self.irq.clear_interrupt();
-                self.irq.enable_interrupt(exti);
             }
         }
         Ok(())
-    }
-
-    /// This function should be only ever be called in an EXTI
-    /// interrupt handler.
-    pub fn exti_irq_handle(&mut self, exti: &mut PinIRQ::Exti) {
-        /*
-         * Disable the PENIRQ so that it wont be false triggering our handler
-         * as per XPT2046 Touch Screen Controller datasheet page 25
-         *
-         * It is recommended that the processor mask the interrupt PENIRQ
-         * is associated with whenever the processor sends
-         * a control byte to the XPT2046. This prevents false triggering of
-         * interrupts when the PENIRQ output is disabled in the cases
-         * discussed in this section.
-         */
-        self.irq.disable_interrupt(exti);
-        self.irq.clear_interrupt();
-        self.screen_state = TouchScreenState::PRESAMPLING;
     }
 
     /// Collects the reading for 3 sample points and
@@ -402,11 +373,10 @@ where
         &mut self,
         dt: &mut DT,
         delay: &mut DELAY,
-        exti: &mut PinIRQ::Exti,
     ) -> Result<(), Error<BusError<SPIError, CSError>>>
     where
         DT: DrawTarget<Color = Rgb565>,
-        DELAY: DelayUs,
+        DELAY: DelayNs,
     {
         let mut calibration_count = 0;
         let mut retry = 3;
@@ -421,7 +391,7 @@ where
         self.operation_mode = TouchScreenOperationMode::CALIBRATION;
         while calibration_count < 4 {
             // We must run our state machine to capture user input
-            self.run(exti)?;
+            self.run()?;
             match calibration_count {
                 0 => {
                     calibration_draw_point(dt, &old_cp.a);
